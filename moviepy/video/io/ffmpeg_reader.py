@@ -3,12 +3,19 @@ import os
 import re
 import subprocess as sp
 import warnings
-
+import requests
 import numpy as np
+import shlex
+import io
 
 from moviepy.config import FFMPEG_BINARY  # ffmpeg, ffmpeg.exe, etc...
 from moviepy.tools import convert_to_seconds, cross_platform_popen_params
 
+
+#There are some... experimental bytesio operations in here. All prior functionality has been kept, as well as handling
+#non-local URLs.
+
+#note, for files which exceed 100MB, you're going to run out of memory. I have not solved this problem yet.
 
 class FFMPEG_VideoReader:
     """Class for video byte-level reading with ffmpeg."""
@@ -28,6 +35,7 @@ class FFMPEG_VideoReader:
 
         self.filename = filename
         self.proc = None
+        self.out=None
         infos = ffmpeg_parse_infos(
             filename,
             check_duration=check_duration,
@@ -82,48 +90,49 @@ class FFMPEG_VideoReader:
         it pre-reads the first frame).
         """
         self.close(delete_lastread=False)  # if any
+        if isinstance(self.filename, io.BytesIO):
+            stream = self.filename
+            self.filename = "pipe:0"
+            stream.seek(0)
+            stdin_pipe, stdin = sp.PIPE, stream.read()
+            #print("we now have stdin_pipe and stdin")
+        else:
+            stdin_pipe, stdin = sp.DEVNULL, None
 
         if start_time != 0:
             offset = min(1, start_time)
-            i_arg = [
-                "-ss",
-                "%.06f" % (start_time - offset),
-                "-i",
-                self.filename,
-                "-ss",
-                "%.06f" % offset,
-            ]
+            i_arg = f"-ss {start_time - offset} -i {self.filename} -ss {offset}"
         else:
-            i_arg = ["-i", self.filename]
+            i_arg = f"-i {self.filename}"
 
-        cmd = (
-            [FFMPEG_BINARY]
-            + i_arg
-            + [
-                "-loglevel",
-                "error",
-                "-f",
-                "image2pipe",
-                "-vf",
-                "scale=%d:%d" % tuple(self.size),
-                "-sws_flags",
-                self.resize_algo,
-                "-pix_fmt",
-                self.pixel_format,
-                "-vcodec",
-                "rawvideo",
-                "-",
-            ]
-        )
+        cmd = shlex.split(f"{FFMPEG_BINARY} {i_arg} -loglevel error -f image2pipe -vf scale={self.size[0]}:{self.size[1]} "
+                          f"-sws_flags {self.resize_algo} -pix_fmt {self.pixel_format} -vcodec rawvideo pipe:1")
+        
+        #print(cmd)
+        #This is soooo slow when it comes to large files. Why? even if the files are passed in...
+        #it's consuming all the memory. It's a memory leak? I mean the problem is happening right here.
+        #Teeny Tiny Files even take 50x that of loading them.
         popen_params = cross_platform_popen_params(
             {
                 "bufsize": self.bufsize,
                 "stdout": sp.PIPE,
                 "stderr": sp.PIPE,
-                "stdin": sp.DEVNULL,
+                "stdin": stdin_pipe,
             }
         )
+        #print("opening proc")
         self.proc = sp.Popen(cmd, **popen_params)
+        #print("proc initiated...")
+        #this is it here. This has to be the problem.
+        if stdin is not None:
+            #This looks like the slowdown is happening. I wonder if I can fix this by muxing around with the
+            #self.proc.communicate(stdin)
+            #print("starting communication...")
+            (out, err) = self.proc.communicate(stdin)
+            #print("communication complete!")
+            #print(type(out))
+            #print(type(err))
+            self.out = io.BytesIO(out)
 
         # self.pos represents the (0-indexed) index of the frame that is next in line
         # to be read by self.read_frame().
@@ -135,8 +144,11 @@ class FFMPEG_VideoReader:
         """Reads and throws away n frames"""
         w, h = self.size
         for i in range(n):
-            self.proc.stdout.read(self.depth * w * h)
-
+            if self.out is None:
+                self.proc.stdout.read(self.depth * w * h)
+            else:
+                self.out.read(self.depth * w * h)
+            #self.proc.stdout.flush()
             # self.proc.stdout.flush()
         self.pos += n
 
@@ -147,9 +159,13 @@ class FFMPEG_VideoReader:
         and stored in ``self.lastread``.
         """
         w, h = self.size
-        nbytes = self.depth * w * h
+        
 
-        s = self.proc.stdout.read(nbytes)
+        nbytes = self.depth * w * h
+        if self.out is None:
+            s = self.proc.stdout.read(nbytes)
+        else:
+            s = self.out.read(nbytes)
 
         if len(s) != nbytes:
             warnings.warn(
@@ -210,7 +226,7 @@ class FFMPEG_VideoReader:
 
         # Initialize proc if it is not open
         if not self.proc:
-            print("Proc not detected")
+            
             self.initialize(t)
             return self.last_read
 
@@ -245,6 +261,8 @@ class FFMPEG_VideoReader:
             self.proc = None
         if delete_lastread and hasattr(self, "last_read"):
             del self.last_read
+        if self.out is not None and not self.out.closed:
+            self.out.close()
 
     def __del__(self):
         self.close()
@@ -742,6 +760,14 @@ class FFmpegInfosParser:
         return (field, value)
 
 
+def anyExist(path):
+    try:
+        r = requests.head(path)
+        return r.status_code == requests.codes.ok
+    except:
+        return os.path.exists(path)
+
+
 def ffmpeg_parse_infos(
     filename,
     check_duration=True,
@@ -792,29 +818,42 @@ def ffmpeg_parse_infos(
       https://github.com/Zulko/moviepy/pull/1222).
     """
     # Open the file in a pipe, read output
-    cmd = [FFMPEG_BINARY, "-hide_banner", "-i", filename]
+    if isinstance(filename, io.BytesIO):
+        stream = filename
+        filename = "pipe:0"
+        stream.seek(0)
+        stdin_pipe, stdin = sp.PIPE, stream.read()
+        #IT WORKS! NO OUTPUT PIPE NEEDED!
+        cmd = shlex.split(f"{FFMPEG_BINARY} -i {filename} -f rawvideo -hide_banner")
+    else:
+        stdin_pipe, stdin = sp.DEVNULL, None
+        cmd = shlex.split(f"{FFMPEG_BINARY} -i {filename} -hide_banner")
     if decode_file:
         cmd.extend(["-f", "null", "-"])
-
+    #so the problem is that the output never seems to actually end. 
     popen_params = cross_platform_popen_params(
         {
             "bufsize": 10**5,
             "stdout": sp.PIPE,
             "stderr": sp.PIPE,
-            "stdin": sp.DEVNULL,
+            "stdin": stdin_pipe,
         }
     )
 
     proc = sp.Popen(cmd, **popen_params)
-    (output, error) = proc.communicate()
+
+    (output, error) = proc.communicate(stdin)
+
     infos = error.decode("utf8", errors="ignore")
 
     proc.terminate()
     del proc
-
     if print_infos:
+        print("now printing infos")
+
         # print the whole info text returned by FFMPEG
         print(infos)
+        #input("Hit enter if you see the infos above")
 
     try:
         return FFmpegInfosParser(
@@ -827,6 +866,6 @@ def ffmpeg_parse_infos(
     except Exception as exc:
         if os.path.isdir(filename):
             raise IsADirectoryError(f"'{filename}' is a directory")
-        elif not os.path.exists(filename):
+        elif not anyExist(filename):
             raise FileNotFoundError(f"'{filename}' not found")
         raise IOError(f"Error passing `ffmpeg -i` command output:\n\n{infos}") from exc

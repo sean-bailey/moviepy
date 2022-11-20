@@ -78,6 +78,7 @@ requires = [
     "imageio_ffmpeg>=0.2.0",
     "numpy>=1.17.3",
     "proglog<=1.0.0",
+    "requests>=2.28.1"
 ]
 
 optional_reqs = [

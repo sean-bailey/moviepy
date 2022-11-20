@@ -18,7 +18,9 @@ try:
 except ImportError:
     DOTENV = None
 
-FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg-imageio")
+#I have no idea why this wasn't set earlier.
+
+FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
 IMAGEMAGICK_BINARY = os.getenv("IMAGEMAGICK_BINARY", "auto-detect")
 
 IS_POSIX_OS = os.name == "posix"
